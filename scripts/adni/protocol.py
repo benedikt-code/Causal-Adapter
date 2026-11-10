@@ -7,6 +7,8 @@ from pathlib import Path
 
 ATTRIBUTES = {"apoE": 2, "age": 1, "sex": 1, "brain_vol": 1, "vent_vol": 1, "slice": 10}
 PARENTS = ["brain_vol", "vent_vol", "slice"]
+ALL_METRICS = ['composition', 'effectiveness', 'fid', 'minimality']
+CORE_METRICS = ['composition', 'effectiveness']
 ADAPTER_REVISION = "e868925fbcb0bf7d0979c8bf2a4d1b8be400f43c"
 BASE_REVISION = "26ed8a9bfbf76f46a6cf60517dde321f900c44ce"
 PAPER = "https://arxiv.org/html/2509.24798v2"
@@ -84,11 +86,15 @@ def audit_data(root: Path, clinical: Path) -> dict:
 
 
 def validate_paths(config: dict) -> dict:
-    needed = ['data_root', 'base_model', 'controlnet', 'embeddings', 'flow_dir', 'predictor_dir', 'unconditional_vae']
+    metrics = config.get('metrics', ALL_METRICS)
+    if not isinstance(metrics, list) or not metrics or any(m not in ALL_METRICS for m in metrics):
+        raise ValueError(f'metrics must be a nonempty list drawn from {ALL_METRICS}')
+    vae_keys = ['unconditional_vae'] if 'minimality' in metrics else []
+    needed = ['data_root', 'base_model', 'controlnet', 'embeddings', 'flow_dir', 'predictor_dir'] + vae_keys
     errors = [f"Missing {key}: {config.get(key)}" for key in needed if not config.get(key) or not Path(config[key]).exists()]
     if errors:
         raise ValueError('\n'.join(errors))
-    for key, default, minimum in [('seed', 40, 0), ('batch_size', 2, 1), ('workers', 0, 0)]:
+    for key, default, minimum in [('seed', 40, 0), ('batch_size', 2, 1), ('workers', 0, 0), ('focused_samples', 512, 1)]:
         value = config.get(key, default)
         if type(value) is not int or value < minimum:
             raise ValueError(f'{key} must be an integer >= {minimum}')
@@ -105,7 +111,7 @@ def validate_paths(config: dict) -> dict:
         errors.append('ControlNet .safetensors path must be a Diffusers model DIRECTORY with config.json')
     elif not any(p.is_file() for pattern in ['*.safetensors', '*.bin'] for p in control.glob(pattern)):
         errors.append('ControlNet directory has no model weights')
-    for key in ['embeddings', 'unconditional_vae']:
+    for key in ['embeddings'] + vae_keys:
         if not Path(config[key]).is_file():
             errors.append(f'{key} must be a file')
     # Release identity is explicit; never infer a different training step.

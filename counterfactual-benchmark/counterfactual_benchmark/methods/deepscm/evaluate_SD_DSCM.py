@@ -697,6 +697,7 @@ def parse_arguments():
     parser.add_argument("--predictor-checkpoint-dir", type=Path)
     parser.add_argument("--unconditional-vae", type=Path, help="ADNI CLD checkpoint")
     parser.add_argument("--interventions", nargs="+", default=None)
+    parser.add_argument("--max-samples", type=int, default=None, help="Seeded subject-balanced ADNI subset for focused evaluation")
     parser.add_argument("--smoke-samples", type=int, default=0)
     return parser.parse_args()
 

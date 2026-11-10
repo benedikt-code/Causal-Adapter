@@ -2,6 +2,54 @@ ADNI reproduction status and commands (2026-11-10, paper **arXiv 2509.24798v2**)
 
 No GPU experiments or preprocessing jobs have been submitted. No quantitative reproduction has completed. Existing handoff/Pendulum work is preserved. Preparation outputs below contain local collection metadata; keep them on approved storage.
 
+Small qualitative demonstration (current image-first workflow):
+
+Submit `qualitative_adni.sbatch`; it calls `scripts/adni/qualitative.py`. Defaults: four distinct subjects, five ventricular-volume targets (.2–.8 normalized), two brain-volume targets (.25/.75) and two age targets (.25/.75). It uses the released notebook SCM head and reuses one factual inversion for all nine edits per subject. No benchmark flows, predictor checkpoints, unconditional evaluation VAE, metric cache, or training are needed. Clinical attributes and preprocessed float TIFFs are still required. The extra SCM output labels are saved rather than assumed to equal the targets for downstream variables.
+
+```bash
+# Set these to the ACTUAL prepared paths; <release-tag> is a placeholder.
+export WORK=/sc-projects/sc-proj-ukb-cvd/projects/bepe10/sturopx/causal-adapter
+export REPO="$WORK/Causal-Adapter"
+export ENV=/sc-projects/sc-proj-ukb-cvd/envs/causal-adapter
+export ADNI_DATA_ROOT="<root-containing-preprocessed_data>"
+export ADNIMERGE_CSV="<matching-clinical-ADNIMERGE.csv>"
+export ADNI_BASE_MODEL="$WORK/models/adni-release-<release-tag>/miniSD-diffusers"
+export ADNI_WEIGHTS="$WORK/models/adni-release-<release-tag>/causal-adapter-weights/ADNI"
+cd "$REPO"
+# Check the site's GPU type/features and add its actual A100 40GB selector:
+sinfo -p gpu -N -o '%N %G %f'
+sbatch qualitative_adni.sbatch
+# Example ONLY if sinfo reports the GRES type exactly as a100:
+# sbatch --gres=gpu:a100:1 qualitative_adni.sbatch
+```
+
+The allocation requests one GPU and one hour; the Python runner verifies one visible A100 with approximately 40 GB before loading diffusion weights. GPU type/constraint names have not been verified on the site. Set `ADNI_SUBJECTS=8` for eight subjects, `ADNI_LEVELS=7` for seven ventricular points, or `ADNI_SEED=...` for a different selection. Default split is `test`, using the existing sorted-subject boundaries. If only a small preprocessing demonstration root exists, explicitly set `ADNI_SPLIT=all` and treat outputs as qualitative examples, not held-out reproduction. The runner never silently reduces the requested subject count or alters clinical pairing. It records scan/clinical date mismatches and excludes out-of-range factual labels only when selecting these qualitative examples.
+
+Optional CPU input validation after activating the existing environment:
+
+```bash
+python scripts/adni/qualitative.py --data-root "$ADNI_DATA_ROOT" --adnimerge-csv "$ADNIMERGE_CSV" --base-model "$ADNI_BASE_MODEL" --weights-root "$ADNI_WEIGHTS" --output-root "$WORK/results/adni/qualitative-preflight-$(date -u +%Y%m%dT%H%M%SZ)" --subjects 4 --split "${ADNI_SPLIT:-test}" --preflight-only
+```
+
+Outputs default to `$WORK/results/adni/qualitative-<job-id>/` (override with `ADNI_OUTPUT` pointing at a new directory). Open `index.html` locally after copying results from the HPC. Each `case_XX/` contains original/reconstruction/edited 256px PNGs, three intervention grids, grayscale bicubic 192px versions, signed difference PNGs against both original and reconstruction, full numeric differences/labels in `labels_and_differences.npz`, and source/target/propagated labels in `case.json`. Blue indicates decreased intensity, red increased intensity, white no change; display saturates at +/-64 of 255 but the NPZ retains full signed values. The manifest records checkpoint/image hashes, revisions, actual GPU/environment, seed, selected source cases and partial/completed status. Existing results are refused. SLURM logs are `adni-qualitative-<job-id>.out/.err` in the submission directory. No quantitative Table 3 claims are made.
+
+Optional focused quantitative plan for one A100 40 GB:
+
+Use the example config's `metrics: ["composition", "effectiveness"]`, `focused_samples: 512`, batch size 2 and seed 40 for smoke, pilot and focused runs. This samples slices across held-out subjects with a fixed seed and saves the exact original indices. It retains 100 DDIM steps and guidance 1.0. Outputs cover the 3×3 volume/slice effectiveness matrix, null-intervention MAE/LPIPS and the smoke's qualitative grids/traversals. FID, CLD, attention, training and baseline runs are omitted; no unconditional evaluation VAE is needed. This is a focused quantitative reproduction, not a complete Table 3 reproduction.
+
+Budget approximately 10–20 minutes for smoke/pilot plus 3–5 GPU-hours for the 512-slice run; request a 6-hour allocation. The latter extrapolates 512 × (three interventions + one reconstruction) × the paper's 5–7 seconds per image, plus overhead. This is not an HPC measurement; batching and storage can change it. Queue time, downloads and CPU FSL preprocessing are excluded. Reserve exactly one GPU with `--gres=gpu:1`; select an A100 40 GB using the site's actual partition/constraint syntax (not yet verified).
+
+After preparing the inputs, complete smoke and pilot with the same config, then use:
+
+```bash
+# ADNI_SMOKE and ADNI_PILOT point to successful manifests from those stages.
+export ADNI_OUTPUT="$WORK/results/adni/focused-$RUN_TAG"
+MODE=focused sbatch --time=06:00:00 --gres=gpu:1 --export=ALL reproduce_adni.sbatch --validated-smoke "$ADNI_SMOKE" --validated-pilot "$ADNI_PILOT"
+# Use the same aggregate.py command below, pointing at this output directory.
+```
+
+The full-metric workflow below remains available only if needed: set config `metrics` to `["composition", "effectiveness", "fid", "minimality"]` and supply the unconditional VAE checkpoint. Do not use that profile for the focused run. Full preprocessing still refuses missing selected scans, and the clinical export plus benchmark flows/image-parent predictors are still required.
+
 Confirmed inventory:
 
 - Checkout: `a9752e9a6ba57456eb3edbebc695cec7d94f1342`, plus this uncommitted patch.
@@ -32,6 +80,8 @@ export TORCH_HOME="$WORK/.cache/torch-adni"
 cd "$REPO"
 mkdir -p "$PREP"
 # Activate the existing ENV and inspect versions before installing anything.
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate "$ENV"
 python -c 'import torch,diffusers; print(torch.__version__, torch.version.cuda, diffusers.__file__)'
 # Only if needed, retain the project fork and add the missing benchmark packages:
 python -m pip install -e diffusers
@@ -113,4 +163,4 @@ For an independently agreed adapter retraining stage, the reviewed candidate set
 python train.py --dataset ADNI --pretrained_model_name_or_path <local-miniSD> --train_data_dir <preprocessing-root> --scm_path <released-ADNI-scm/best_model.pt> --output_dir <new-training-root> --output_name adni-paper-candidate --resolution 256 --train_batch_size 2 --gradient_accumulation_steps 20 --max_train_steps 100000 --learning_rate 1e-5 --adam_weight_decay .01 --infonce_temperature .2 --infonce_scale .0005 --seed 40 --save_steps 1000 --checkpointing_steps 1000 --placeholder_string 'a mri image of @ and * and &' --presudo_words '@,*,&' --presudo_words_infonce '@,*,&' --mcpl_training True --causal_training False --task_cond generation_text_global_after
 ```
 
-Validation performed locally: 11 synthetic CPU regression tests (loader/joins/codecs, split counts, XML/archive mapping, DDIM call boundary, deterministic sampling, Gaussian KL, partial-batch aggregation, coverage rejection, saved grids), shell syntax and Python compilation. Real model/predictor loading, FSL output, CUDA kernels, complete metrics and attention remain untested because their prerequisites are unavailable.
+Validation performed locally: 17 synthetic CPU regression tests (loader/joins/codecs, split counts, XML/archive mapping, DDIM call boundary, deterministic sampling, Gaussian KL, partial-batch aggregation, coverage rejection, saved grids), shell syntax and Python compilation. Real model/predictor loading, FSL output, CUDA kernels, complete metrics and attention remain untested because their prerequisites are unavailable.

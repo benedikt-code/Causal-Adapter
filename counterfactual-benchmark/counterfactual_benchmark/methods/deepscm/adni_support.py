@@ -12,7 +12,7 @@ import pickle
 import numpy as np
 import torch
 from PIL import Image, ImageDraw
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from scripts.adni.protocol import ATTRIBUTES, PARENTS, unique_checkpoint
 
@@ -28,7 +28,12 @@ def validate_evaluator_args(args):
         args.interventions = PARENTS.copy()
     if args.interventions != PARENTS:
         raise ValueError(f'Paper evaluation interventions must be {PARENTS}')
-    for name in ['data_root', 'flow_checkpoint_dir', 'predictor_checkpoint_dir', 'unconditional_vae']:
+    if args.max_samples is not None and (args.max_samples < 1 or 'minimality' in args.metrics):
+        raise ValueError('max-samples must be positive and cannot be combined with full-reference CLD')
+    required_paths = ['data_root', 'flow_checkpoint_dir', 'predictor_checkpoint_dir']
+    if 'minimality' in args.metrics:
+        required_paths.append('unconditional_vae')
+    for name in required_paths:
         if getattr(args, name, None) is None:
             raise ValueError(f'ADNI requires explicit --{name.replace("_", "-")}')
     if Path(__import__('os').environ.get('CAUSAL_ADAPTER_SD15_BASE_MODEL', '')).is_dir() is False:
@@ -40,7 +45,9 @@ def validate_evaluator_args(args):
         'base_model': __import__('os').environ['CAUSAL_ADAPTER_SD15_BASE_MODEL'],
         'controlnet': args.controlnet_path, 'embeddings': args.mcpl_embedding_path,
         'flow_dir': str(args.flow_checkpoint_dir), 'predictor_dir': str(args.predictor_checkpoint_dir),
-        'unconditional_vae': str(args.unconditional_vae)})
+        'unconditional_vae': str(args.unconditional_vae) if args.unconditional_vae else None, 'metrics': args.metrics})
+    if args.max_samples and args.max_samples > args.preflight_audit['splits']['test']['kept_slices']:
+        raise ValueError('Requested focused subset exceeds the available held-out population')
     if Path(args.output_root).joinpath('ADNI').exists():
         raise FileExistsError(f'ADNI outputs already exist under {args.output_root}')
 
@@ -152,6 +159,28 @@ def cld_scores(reference, reference_labels, factuals, counterfactuals, parents, 
     return np.array(scores), skipped
 
 
+def subject_balanced_indices(subjects, count, seed):
+    """Select held-out slices across subjects without replacement, with fixed seed."""
+    if count < 1 or count > len(subjects):
+        raise ValueError(f'Requested {count} slices, but held-out population has {len(subjects)}')
+    rng = np.random.default_rng(seed)
+    groups = {}
+    for index, subject in enumerate(subjects):
+        groups.setdefault(subject, []).append(index)
+    order = list(sorted(groups))
+    rng.shuffle(order)
+    for indices in groups.values():
+        rng.shuffle(indices)
+    selected = []
+    while len(selected) < count:
+        for subject in order:
+            if groups[subject]:
+                selected.append(groups[subject].pop())
+                if len(selected) == count:
+                    break
+    return sorted(selected)
+
+
 @torch.inference_mode()
 def evaluate_adni(evaluator, args, pipe, prompt, scm, train_set, test_set, config_cls):
     if dict(args.attribute_size) != ATTRIBUTES or list(args.attribute_size) != list(ATTRIBUTES):
@@ -168,12 +197,14 @@ def evaluate_adni(evaluator, args, pipe, prompt, scm, train_set, test_set, confi
     predictors = evaluator.build_predictors('adni', ATTRIBUTES, PARENTS, config_cls, args)
     from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
     lpips = LearnedPerceptualImagePatchSimilarity(net_type='alex', normalize=True, reduction='none').cuda().eval()
-    from models.vaes import ADNICondVAE
-    params = {'context_dim': 0, 'latent_dim': 100, 'hidden_dim': 512,
-              'n_chan': [1, 16, 24, 32, 64, 128, 256], 'beta': 3, 'lr': 1e-3,
-              'weight_decay': .01, 'fixed_logvar': 'False'}
-    vae = ADNICondVAE(params, ATTRIBUTES, unconditional=True).cuda().eval()
-    vae.load_state_dict(torch.load(args.unconditional_vae, map_location='cuda', weights_only=False)['state_dict'])
+    vae = None
+    if 'minimality' in args.metrics:
+        from models.vaes import ADNICondVAE
+        params = {'context_dim': 0, 'latent_dim': 100, 'hidden_dim': 512,
+                  'n_chan': [1, 16, 24, 32, 64, 128, 256], 'beta': 3, 'lr': 1e-3,
+                  'weight_decay': .01, 'fixed_logvar': 'False'}
+        vae = ADNICondVAE(params, ATTRIBUTES, unconditional=True).cuda().eval()
+        vae.load_state_dict(torch.load(args.unconditional_vae, map_location='cuda', weights_only=False)['state_dict'])
     from torchmetrics.image.fid import FrechetInceptionDistance
     fid = FrechetInceptionDistance(normalize=True).cuda() if 'fid' in args.metrics else None
     def features(image):
@@ -191,7 +222,10 @@ def evaluate_adni(evaluator, args, pipe, prompt, scm, train_set, test_set, confi
                     interventions=intervention if intervention is not None else sample_interventions(batch, indices, parent, test_set, args.seed, bins=train_set.bins))
         check_tensor(result['image'], (1, 192, 192), 0, 1, 'counterfactual')
         return result
-    loader = DataLoader(test_set, batch_size=args.bs, shuffle=False, num_workers=args.dataloader_num_workers, drop_last=False)
+    selected_indices = subject_balanced_indices(test_set.sample_subjects, args.max_samples, args.seed) if args.max_samples else list(range(len(test_set)))
+    (output / 'selected_indices.json').write_text(json.dumps({'seed': args.seed, 'indices': selected_indices, 'strategy': 'round robin over seeded shuffled subjects and within-subject slices' if args.max_samples else 'all test slices'}))
+    evaluation_set = Subset(test_set, selected_indices) if args.max_samples else test_set
+    loader = DataLoader(evaluation_set, batch_size=args.bs, shuffle=False, num_workers=args.dataloader_num_workers, drop_last=False)
     comp_mae, comp_lpips, comp_indices = [], [], []
     results = {p: {'predictions': {a: [] for a in PARENTS}, 'targets': {a: [] for a in PARENTS}, 'indices': []} for p in PARENTS}
     reference, reference_labels = [], {p: [] for p in PARENTS}
@@ -203,12 +237,15 @@ def evaluate_adni(evaluator, args, pipe, prompt, scm, train_set, test_set, confi
         check_labels(batch)
         factual = resize(batch['image'])
         check_tensor(factual, (1, 192, 192), 0, 1, 'benchmark input')
-        reference.append(features(factual))
-        for parent in PARENTS:
-            values = batch[parent].sum(1) if parent == 'slice' else batch[parent].reshape(-1)
-            reference_labels[parent].extend(values.cpu().tolist())
+        if vae is not None:
+            reference.append(features(factual))
+            for parent in PARENTS:
+                values = batch[parent].sum(1) if parent == 'slice' else batch[parent].reshape(-1)
+                reference_labels[parent].extend(values.cpu().tolist())
         if args.max_batches is not None and batch_index >= args.max_batches:
-            continue
+            if vae is not None:
+                continue
+            break
         if 'composition' in args.metrics or args.smoke_samples:
             reconstructed, _, _, _ = evaluator.ddim_modules.ddim_editing(
                 pipe, batch['image'], labels(batch), args.presudo_token_ids, prompt,
@@ -274,11 +311,11 @@ def evaluate_adni(evaluator, args, pipe, prompt, scm, train_set, test_set, confi
             for i in range(min(args.smoke_samples, len(indices))):
                 save_grid(qualitative, f'smoke-{int(indices[i])}', factual[i], reconstructed[i],
                           [generated_by_parent[p]['image'][i] for p in PARENTS])
-    report = {'scope': 'smoke' if args.smoke_samples else ('pilot' if args.max_batches else 'full'),
-              'test_samples': len(test_set), 'metrics': {}, 'interventions': PARENTS,
+    report = {'scope': 'smoke' if args.smoke_samples else ('pilot' if args.max_batches else ('focused' if args.max_samples else 'full')),
+              'test_samples': len(test_set), 'metrics': {}, 'interventions': PARENTS, 'requested_metrics': args.metrics,
               'protocol_deviations': ['Dataset uses sorted-subject 70/15/15 split with all visits and positional clinical joins.',
                 'Interventions use independent per-sample seeded draws rather than batch-dependent global RNG.',
-                'CLD corrects the legacy posterior-KL and integer-volume-label bugs; reference is full held-out set.',
+                'CLD, when requested, corrects the legacy posterior-KL and integer-volume-label bugs; reference is full held-out set.',
                 'Paper does not specify the exact uncertainty chunks, F1 averaging, FID real split, or attention schedules.']}
     if comp_mae:
         np.savez(output / 'composition.npz', mae_255=comp_mae, lpips=comp_lpips, indices=comp_indices)

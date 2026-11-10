@@ -122,12 +122,14 @@ class ADNI(Dataset):
                                                                keep_only_screening=keep_only_screening)
 
         csv_path = resolve_adnimerge(dataset_dir, csv_path)
+        sample_subjects = list(attribute_dict['subject'])
         self.attributes, indices_to_remove = load_extra_attributes(csv_path, attributes=attribute_size.keys(),
                                                                    attribute_dict=attribute_dict, subject_dates_dict=subject_dates_dict,
                                                                    keep_only_screening=keep_only_screening)
         self.attributes['slice'] = np.delete(self.attributes['slice'], indices_to_remove, axis=0)
 
         removed = set(indices_to_remove)
+        self.sample_subjects = [subject for i, subject in enumerate(sample_subjects) if i not in removed]
         self.images = [transform_img_SD_input(item) for i, item in enumerate(images) if i not in removed]
         if not self.images:
             raise ValueError(f'No usable ADNI slices in split {split} at {data_dir}')

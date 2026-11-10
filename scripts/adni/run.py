@@ -15,7 +15,7 @@ import sys
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from scripts.adni.protocol import ATTRIBUTES, PARENTS, PAPER, identify, validate_paths
+from scripts.adni.protocol import ATTRIBUTES, PARENTS, PAPER, ALL_METRICS, CORE_METRICS, identify, validate_paths
 
 
 def command(config, mode, output):
@@ -23,13 +23,16 @@ def command(config, mode, output):
             '--dataset', 'ADNI', '--editing', 'standard', '--NTI', 'False', '--num_steps', '100',
             '--guidance_scale', '1.0', '--resolution', '256', '--seed', str(config.get('seed', 40)),
             '--bs', str(config.get('batch_size', 2)), '--dataloader_num_workers', str(config.get('workers', 0)),
-            '--metrics', 'composition', 'effectiveness', 'fid', 'minimality', '--embeddings', 'lpips',
+            '--metrics', *config.get('metrics', ALL_METRICS), '--embeddings', 'lpips',
             '--cycles', '1', '--interventions', *PARENTS, '--output-root', str(output)]
     for key, flag in [('data_root', '--data-root'), ('adnimerge_csv', '--adnimerge-csv'),
                       ('controlnet', '--controlnet_path'), ('embeddings', '--mcpl_embedding_path'),
-                      ('flow_dir', '--flow-checkpoint-dir'), ('predictor_dir', '--predictor-checkpoint-dir'),
-                      ('unconditional_vae', '--unconditional-vae')]:
+                      ('flow_dir', '--flow-checkpoint-dir'), ('predictor_dir', '--predictor-checkpoint-dir')]:
         args.extend([flag, config[key]])
+    if 'minimality' in config.get('metrics', ALL_METRICS):
+        args.extend(['--unconditional-vae', config['unconditional_vae']])
+    if mode == 'focused':
+        args.extend(['--max-samples', str(config.get('focused_samples', 512))])
     if mode == 'smoke':
         args.extend(['--max-batches', str(max(1, (2 + config.get('batch_size', 2) - 1) // config.get('batch_size', 2))), '--smoke-samples', '2'])
     if mode == 'pilot':
@@ -40,7 +43,7 @@ def command(config, mode, output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, required=True)
-    parser.add_argument('--mode', choices=['preflight', 'smoke', 'pilot', 'full', 'attention'], default='preflight')
+    parser.add_argument('--mode', choices=['preflight', 'smoke', 'pilot', 'focused', 'full', 'attention'], default='preflight')
     parser.add_argument('--validated-smoke', type=Path, help='Successful smoke manifest with matching inputs')
     parser.add_argument('--validated-pilot', type=Path, help='Successful one-batch quantitative pilot manifest')
     parser.add_argument('--output-root', type=Path, required=True, help='New directory; existing outputs are refused')
@@ -63,7 +66,9 @@ def main():
         path.write_text(json.dumps(manifest, indent=2))
         if any(audit['splits'][s]['kept_slices'] == 0 for s in ['train', 'test']):
             raise ValueError('Train and test must both have usable slices')
-        for stage, required in [('smoke', args.mode in ['pilot', 'full']), ('pilot', args.mode == 'full')]:
+        if args.mode == 'focused' and config.get('metrics', ALL_METRICS) != CORE_METRICS:
+            raise ValueError(f'Focused mode requires config metrics={CORE_METRICS}; use it for smoke and pilot too')
+        for stage, required in [('smoke', args.mode in ['pilot', 'focused', 'full']), ('pilot', args.mode in ['focused', 'full'])]:
             if required:
                 prior_path = getattr(args, 'validated_' + stage)
                 if prior_path is None:
@@ -103,8 +108,10 @@ def main():
         manifest['torch_home'] = os.environ['TORCH_HOME']
         manifest['metric_cache_identity'] = identify(Path(os.environ['TORCH_HOME']) / 'hub/checkpoints')
         manifest['packages'] = subprocess.check_output([sys.executable, '-m', 'pip', 'freeze'], text=True).splitlines()
-        manifest['artifacts'] = {k: identify(Path(config[k])) for k in
-                                 ['base_model', 'controlnet', 'embeddings', 'flow_dir', 'predictor_dir', 'unconditional_vae']}
+        artifact_keys = ['base_model', 'controlnet', 'embeddings', 'flow_dir', 'predictor_dir']
+        if 'minimality' in config.get('metrics', ALL_METRICS):
+            artifact_keys.append('unconditional_vae')
+        manifest['artifacts'] = {k: identify(Path(config[k])) for k in artifact_keys}
         manifest['data_identity'] = identify(Path(config['data_root']) / 'preprocessed_data')
         source_files = [p for folder in ['scripts/adni'] for p in (REPO / folder).glob('*.py')]
         source_files += [REPO / 'counterfactual-benchmark/counterfactual_benchmark/methods/deepscm/adni_support.py']
@@ -133,11 +140,13 @@ def main():
         metric_report = json.loads(metric_paths[0].read_text())
         manifest['metrics_path'] = str(metric_paths[0])
         manifest['evaluated_samples'] = metric_report['evaluated_samples']
+        if args.mode == 'focused' and metric_report['evaluated_samples'] != config.get('focused_samples', 512):
+            raise ValueError('Focused run did not evaluate the requested sample count')
         if args.mode == 'full' and metric_report['evaluated_samples'] != audit['splits']['test']['kept_slices']:
             raise ValueError('Full evaluation missed held-out samples')
         if args.mode == 'smoke' and not list(metric_paths[0].parent.glob('smoke/*.png')):
             raise ValueError('Smoke run produced no qualitative grids')
-        manifest['status'] = 'smoke_completed' if args.mode == 'smoke' else ('pilot_completed' if args.mode == 'pilot' else 'evaluation_completed')
+        manifest['status'] = 'smoke_completed' if args.mode == 'smoke' else ('pilot_completed' if args.mode == 'pilot' else ('focused_completed' if args.mode == 'focused' else 'evaluation_completed'))
     except Exception as exc:
         manifest['status'] = 'blocked' if manifest['status'] == 'preflight' else 'failed'
         manifest['error'] = str(exc)

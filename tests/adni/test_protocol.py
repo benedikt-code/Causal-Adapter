@@ -11,6 +11,7 @@ import unittest
 import warnings
 import zipfile
 import sys
+import subprocess
 
 import numpy as np
 from PIL import Image
@@ -22,9 +23,11 @@ sys.path.insert(0, str(REPO / 'counterfactual-benchmark/counterfactual_benchmark
 from scripts.adni.protocol import ATTRIBUTES, audit_data, unique_checkpoint, validate_paths
 from scripts.adni.aggregate import aggregate, score_attribute
 from causal_datasets.adni_dataset import load_data, load_extra_attributes, resolve_adnimerge, split_subjects
-from adni_support import check_labels, cld_scores, kl_distance, sample_interventions, save_grid
+from adni_support import check_labels, cld_scores, kl_distance, sample_interventions, save_grid, subject_balanced_indices
 from scripts.adni.metadata_from_xml import convert
 from scripts.adni.preprocess import locate
+from scripts.adni.run import command
+from scripts.adni.qualitative import select_cases, generate_case, read_factual, signed_difference, write_gallery
 
 
 def benchmark_loader():
@@ -225,6 +228,141 @@ class ProtocolTests(unittest.TestCase):
         with Image.open(self.root / 'synthetic-smoke.png') as image:
             self.assertEqual(image.size, (960, 406))
             self.assertEqual(image.getpixel((400, 220)), (255, 255, 255))
+
+    def test_focused_subset_is_balanced_unique_and_repeatable(self):
+        subjects = ['subject-a'] * 10 + ['subject-b'] * 10 + ['subject-c'] * 10
+        indices = subject_balanced_indices(subjects, 8, 40)
+        self.assertEqual(indices, subject_balanced_indices(subjects, 8, 40))
+        self.assertEqual(len(set(indices)), 8)
+        counts = [sum(subjects[i] == subject for i in indices) for subject in sorted(set(subjects))]
+        self.assertLessEqual(max(counts) - min(counts), 1)
+        self.assertNotEqual(indices, subject_balanced_indices(subjects, 8, 41))
+        with self.assertRaises(ValueError):
+            subject_balanced_indices(subjects, 31, 40)
+
+    def test_focused_command_omits_cld_and_keeps_paper_sampling(self):
+        config = {key: 'explicit-path' for key in ['data_root', 'adnimerge_csv', 'controlnet', 'embeddings', 'flow_dir', 'predictor_dir']}
+        config.update(metrics=['composition', 'effectiveness'], focused_samples=512)
+        args = command(config, 'focused', self.root / 'result')
+        self.assertEqual(args[args.index('--max-samples') + 1], '512')
+        self.assertEqual(args[args.index('--num_steps') + 1], '100')
+        self.assertNotIn('--unconditional-vae', args)
+        self.assertNotIn('minimality', args)
+        self.assertNotIn('fid', args)
+        self.assertEqual(args[args.index('--NTI') + 1], 'False')
+
+    def test_qualitative_selection_preserves_split_and_join(self):
+        cases, audit = select_cases(self.root, self.csv, 'all', 4, 40)
+        again, _ = select_cases(self.root, self.csv, 'all', 4, 40)
+        self.assertEqual(cases, again)
+        self.assertEqual(len({case['subject'] for case in cases}), 4)
+        self.assertFalse(audit['held_out_claim'])
+        for case in cases:
+            self.assertEqual(case['stored_slice'], 15)
+            self.assertEqual(len(case['label']), 16)
+            self.assertTrue(case['scan_and_exam_dates_match'])
+        held_out, audit = select_cases(self.root, self.csv, 'test', 1, 40)
+        self.assertEqual(held_out[0]['subject'], '008_S_0001')
+        self.assertTrue(audit['held_out_claim'])
+        with self.assertRaisesRegex(ValueError, 'only 1'):
+            select_cases(self.root, self.csv, 'test', 4, 40)
+
+    def test_qualitative_generation_reuses_inversion_and_saves_all_outputs(self):
+        from torchvision import transforms
+        case = select_cases(self.root, self.csv, 'all', 1, 40)[0][0]
+        prefix = [transforms.Pad(6), transforms.Resize((256, 256))]
+        image_transform = transforms.Compose(prefix + [transforms.ToTensor(), transforms.Normalize([.5], [.5])])
+        original_transform = transforms.Compose(prefix)
+        factual = original_transform(read_factual(case['image_path']))
+        assets = SimpleNamespace(pipe=None, prompt='padded ADNI prompt', presudo_token_ids=[12, 13, 14], device=torch.device('cpu'))
+        calls = {'inversions': 0, 'samples': []}
+        latent = torch.ones(1, 4, 32, 32)
+        def invert(pipe, image, label, token_ids, prompt, **kwargs):
+            calls['inversions'] += 1
+            self.assertEqual(kwargs['num_steps'], 100)
+            self.assertFalse(kwargs['pnp_inversion'])
+            self.assertEqual(token_ids, assets.presudo_token_ids)
+            return [factual], [latent], None, None
+        def sample(pipe, prompt, token_ids, **kwargs):
+            self.assertTrue(torch.equal(kwargs['start_latents'], latent))
+            self.assertEqual(kwargs['num_inference_steps'], 100)
+            self.assertEqual(kwargs['guidance_scale'], 1.)
+            self.assertFalse(kwargs['disentangle'])
+            index, value = kwargs['intervention_indx'], kwargs['intervention_values']
+            # Return propagated labels, as the real helper does. The runner must
+            # retain these instead of replacing them with the requested scalar.
+            encoded = kwargs['label'].clone()
+            offset = {1: 2, 3: 4, 4: 5}[index]
+            encoded[0, offset] = value
+            if index == 3:
+                encoded[0, 5] = value / 2
+            calls['samples'].append(index)
+            return [Image.new('RGB', (256, 256), color=(int(value * 255),) * 3)], encoded.unsqueeze(-1)
+        target = self.root / 'case_00'
+        result = generate_case(assets, case, target, (image_transform, original_transform), invert, sample, 5)
+        self.assertEqual(calls['inversions'], 1)
+        self.assertEqual(calls['samples'], [4] * 5 + [3] * 2 + [1] * 2)
+        self.assertEqual(result['png_files'], 47)
+        self.assertEqual(result['interventions'], 9)
+        metadata = json.loads((target / 'case.json').read_text())
+        self.assertEqual(metadata['interventions'][5]['encoded_label'][5], .125)
+        with np.load(target / 'labels_and_differences.npz') as values:
+            self.assertTrue(np.all(values['reconstruction_minus_original'] == 0))
+            self.assertEqual(values['vent_vol_00_minus_original'].shape, (256, 256))
+        write_gallery(self.root, [result])
+        self.assertIn('case_00/vent_vol_grid.png', (self.root / 'index.html').read_text())
+        with Image.open(target / 'benchmark_192/original.png') as image:
+            self.assertEqual(image.size, (192, 192))
+            self.assertEqual(image.mode, 'L')
+        with self.assertRaises(FileExistsError):
+            generate_case(assets, case, target, (image_transform, original_transform), invert, sample, 5)
+
+    def test_signed_difference_colors_preserve_raw_values(self):
+        invalid = self.root / 'integer-input.tiff'
+        Image.fromarray(np.zeros((180, 180), dtype=np.uint8)).save(invalid)
+        with self.assertRaisesRegex(ValueError, 'floating-point'):
+            read_factual(invalid)
+        black = Image.new('RGB', (2, 2), 'black')
+        white = Image.new('RGB', (2, 2), 'white')
+        shown, raw = signed_difference(white, black)
+        self.assertEqual(shown.getpixel((0, 0)), (255, 0, 0))
+        self.assertEqual(float(raw[0, 0]), 255.)
+        shown, raw = signed_difference(black, white)
+        self.assertEqual(shown.getpixel((0, 0)), (0, 0, 255))
+        self.assertEqual(float(raw[0, 0]), -255.)
+        shown, raw = signed_difference(white, white)
+        self.assertEqual(shown.getpixel((0, 0)), (255, 255, 255))
+        self.assertTrue(np.all(raw == 0))
+
+    def test_qualitative_cpu_preflight_needs_no_benchmark_models_or_cuda(self):
+        base = self.root / 'base'
+        base.mkdir()
+        (base / 'model_index.json').write_text('{}')
+        for name in ['tokenizer', 'text_encoder', 'unet', 'vae', 'scheduler']:
+            (base / name).mkdir()
+        weights = self.root / 'ADNI'
+        control = weights / 'controlnet/controlnet-steps-100000.safetensors'
+        control.mkdir(parents=True)
+        (control / 'config.json').write_text(json.dumps({'_class_name': 'Causal_ControlNetModel', 'dataset': 'ADNI', 'task_cond': 'generation_text_global_after'}))
+        (control / 'diffusion_pytorch_model.safetensors').write_bytes(b'synthetic placeholder, not model weights')
+        (control.parent / 'learned_embeds-steps-100000.safetensors').write_bytes(b'synthetic placeholder')
+        (weights / 'scm').mkdir()
+        (weights / 'scm/best_model.pt').write_bytes(b'synthetic placeholder')
+        output = self.root / 'preflight-output'
+        cmd = [sys.executable, str(REPO / 'scripts/adni/qualitative.py'), '--data-root', str(self.root),
+               '--base-model', str(base), '--weights-root', str(weights), '--output-root', str(output),
+               '--subjects', '2', '--split', 'all', '--preflight-only']
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = json.loads((output / 'manifest.json').read_text())
+        self.assertEqual(manifest['status'], 'inputs_validated_no_images_generated')
+        self.assertFalse(manifest['protocol']['quantitative_reproduction'])
+        self.assertEqual(len(manifest['cases']), 2)
+        self.assertFalse(list(output.glob('case_*')))
+        contents = (output / 'manifest.json').read_bytes()
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((output / 'manifest.json').read_bytes(), contents)
 
     def test_aggregate_refuses_incomplete_full_population(self):
         report = {'scope': 'full', 'test_samples': 3, 'metrics': {}, 'protocol_deviations': []}

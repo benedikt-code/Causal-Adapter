@@ -50,7 +50,7 @@ def score_attribute(logits, targets, attr, chunk_size=256):
 def aggregate(root, chunk_size=256):
     report = json.loads((root / 'metrics.json').read_text())
     out = {'scope': report['scope'], 'paper': 'https://arxiv.org/html/2509.24798v2',
-           'effectiveness': {}, 'metrics': report['metrics'], 'missing': [], 'deviations': report['protocol_deviations'],
+           'effectiveness': {}, 'metrics': report['metrics'], 'missing': [], 'not_requested': [], 'deviations': report['protocol_deviations'],
            'reference_table3': TABLE3['standard']}
     for parent in PARENTS:
         entry = load_results(str(root / parent / 'final_results.pkl'))
@@ -71,6 +71,10 @@ def aggregate(root, chunk_size=256):
             scores['delta'] = scores['value'] - scores['paper_value']
             out['effectiveness'][parent][attr] = scores
     for name in ['composition_mae_255', 'composition_lpips', 'fid', 'cld_corrected']:
+        source_metric = 'composition' if name.startswith('composition') else ('minimality' if name == 'cld_corrected' else name)
+        if source_metric not in report.get('requested_metrics', ['composition', 'effectiveness', 'fid', 'minimality']):
+            out['not_requested'].append(name)
+            continue
         if name not in out['metrics'] or out['metrics'][name].get('value', out['metrics'][name].get('mean')) is None:
             out['missing'].append(name)
     if (root / 'composition.npz').exists():
@@ -95,7 +99,7 @@ def render(report):
     for name in ['composition_mae_255', 'composition_lpips', 'fid', 'cld_corrected']:
         score = report['metrics'].get(name, {})
         value = score.get('value', score.get('mean'))
-        lines.append(f"| {name} | {value if value is not None else 'missing'} | {TABLE3['standard'][name]} |")
+        lines.append(f"| {name} | {value if value is not None else ('not requested' if name in report.get('not_requested', []) else 'missing')} | {TABLE3['standard'][name]} |")
     lines += ['', 'CLD uses corrected Gaussian KL; its numeric equivalence to the paper implementation is unresolved.',
               'Missing: ' + (', '.join(report['missing']) or 'none'), '', *report['deviations']]
     return '\n'.join(lines) + '\n'
