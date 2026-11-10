@@ -82,81 +82,12 @@ def unnormalize(value, name):
     value = (value * (MIN_MAX[name][1] - MIN_MAX[name][0])) +  MIN_MAX[name][0]
     return value
 
-def load_data(data_dir, normalize_=True, num_of_slices=30, split='train', keep_only_screening=False):
-    # TODO also try [-1,1]
-    def img_to_0_1(img):
-        # [-1,1] -> [0,1]
-        return (img + 1) / 2 if normalize_ else img
-
-    leave_out_first = (TOTAL_SLICES - num_of_slices) // 2
-    valid_range = range(leave_out_first, leave_out_first + num_of_slices)
-
-    attributes = {'subject': [],
-                'slice': [],
-                'date': []}
-    subject_dates_dict = {}
-    images = []
-    subject_paths = split_subjects(sorted(Path(data_dir).glob('*')), split)
-    # subtract the path for testing
-    for subject_path in subject_paths:
-        dates = sorted(list(subject_path.glob('*/*')), key=lambda d: d.name)
-        if keep_only_screening:
-            dates = dates[:1]
-            # these subjects have volume measures for the second date
-            if subject_path.name in ["123_S_0050", "137_S_0825"]:
-                dates = dates[1:2]
-        subject_dates_dict[subject_path.name] = []
-        for date_path in dates:
-            date = date_path.name
-            subject_dates_dict[subject_path.name].append(date)
-
-            for image_path in sorted(date_path.glob('*/*.tiff')):
-                slice = int(image_path.stem.split('slice')[1])
-                if slice in valid_range:
-                    images.append(img_to_0_1(np.array(Image.open(image_path))))
-                    attributes['subject'].append(subject_path.name)
-                    attributes['slice'].append(encode_attribute(slice - leave_out_first, 'slice', num_of_slices))
-                    attributes['date'].append(date)
-
-    return np.array(images), attributes, subject_dates_dict
-
-def load_extra_attributes(csv_path, attributes, attribute_dict, subject_dates_dict, keep_only_screening=False):
-    index_col = 'PTID'
-    usecols = [index_col, 'VISCODE', 'EXAMDATE'] + [ATTRIBUTE_MAPPING[att] for att in attributes if att in ATTRIBUTE_MAPPING]
-    df = pd.read_csv(csv_path, usecols=usecols, index_col=index_col).sort_index()
-
-    for att in ATTRIBUTE_MAPPING:
-        if att in attributes:
-            attribute_dict[att] = []
-
-    indices_to_remove = []
-
-    for idx, (subject, date) in enumerate(zip(attribute_dict['subject'], attribute_dict['date'])):
-        subject_df = df.loc[subject].sort_values(by='EXAMDATE')
-
-        # these subjects have volume measures for the second exam
-        if keep_only_screening and subject in ["123_S_0050", "137_S_0825"]:
-            date_idx = 1
-        else:
-            date_idx = subject_dates_dict[subject].index(date)
-
-        if date_idx >= len(subject_df) or subject_df.iloc[date_idx].isnull().any().any():
-            # print(f'Skipping {subject} {date}')
-            indices_to_remove.append(idx)
-            continue
-
-        for att, csv_att in ATTRIBUTE_MAPPING.items():
-            if att in attributes:
-                value = encode_attribute(subject_df[csv_att].iloc[date_idx], att)
-                if att == 'age':
-                    value = fix_age(initial_age=value, visit=subject_df["VISCODE"].iloc[date_idx])
-                attribute_dict[att].append(value)
-
-    del attribute_dict['subject']
-    del attribute_dict['date']
-    return attribute_dict, indices_to_remove
+# Share the training loader's split and clinical pairing without changing either.
+from causal_datasets.adni_dataset import load_data, load_extra_attributes, resolve_adnimerge
 
 def transform_img_SD_input(img):
+    if img.shape != (180, 180) or not np.isfinite(img).all() or img.min() < 0 or img.max() > 1:
+        raise ValueError("Expected finite 180x180 ADNI slices in [0,1] after TIFF [-1,1] conversion")
     image_array = (img * 255).clip(0, 255).astype(np.uint8)
     image = Image.fromarray(image_array, mode="L")
     if not image.mode == "RGB":
@@ -174,7 +105,7 @@ def transform_img_SD_input(img):
 class ADNI(Dataset):
     def __init__(self, attribute_size, split='train', normalize_=True,
                  transform=None, transform_cls=None, num_of_slices=30, keep_only_screening=False,
-                 dataset_dir=os.path.join(os.path.dirname(os.path.realpath(__file__)),'preprocessing')):
+                 dataset_dir=os.path.join(os.path.dirname(os.path.realpath(__file__)),'preprocessing'), csv_path=None):
         super().__init__()
         self.has_valid_set = True
         self.transform = transform
@@ -190,14 +121,18 @@ class ADNI(Dataset):
                                                                split=split,
                                                                keep_only_screening=keep_only_screening)
 
-        csv_path = list(Path(dataset_dir).glob('ADNIMERGE*.csv'))[0]
-        assert csv_path.is_file(), "Provide ADNIMERGE csv path"
+        csv_path = resolve_adnimerge(dataset_dir, csv_path)
         self.attributes, indices_to_remove = load_extra_attributes(csv_path, attributes=attribute_size.keys(),
                                                                    attribute_dict=attribute_dict, subject_dates_dict=subject_dates_dict,
                                                                    keep_only_screening=keep_only_screening)
         self.attributes['slice'] = np.delete(self.attributes['slice'], indices_to_remove, axis=0)
 
-        self.images = [transform_img_SD_input(item) for i, item in enumerate(images) if i not in indices_to_remove]
+        removed = set(indices_to_remove)
+        self.images = [transform_img_SD_input(item) for i, item in enumerate(images) if i not in removed]
+        if not self.images:
+            raise ValueError(f'No usable ADNI slices in split {split} at {data_dir}')
+        self.audit = {'loaded_slices': len(images), 'dropped_slices': len(removed),
+                      'kept_slices': len(self.images), 'csv_path': str(csv_path)}
         
         #self.images = self.pad(torch.as_tensor(np.delete(images, indices_to_remove, axis=0).copy(), dtype=torch.float32).unsqueeze(1))
 

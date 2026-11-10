@@ -75,7 +75,7 @@ from ctf_datasets.pendulum.dataset_SD import unnormalize as unnormalize_pend
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
-rng = np.random.default_rng()
+rng = np.random.default_rng(0)
 device = torch.device("cuda")
 
 # dataset name (as stored in the config "dataset" field) -> (Dataset class, unnormalize fn)
@@ -252,7 +252,7 @@ def _p2p_blend_params(dataset, intervention_indx):
 
 def produce_counterfactuals(pipe, prompt, factual_batch: torch.Tensor, scm: nn.Module, do_parent: str,
                             intervention_source: Dataset, force_change: bool = False, possible_values=None,
-                            device: str = 'cuda', bins=None, args=None):
+                            device: str = 'cuda', bins=None, args=None, interventions=None):
     """Abduct -> intervene -> generate one counterfactual batch.
 
     Returns:
@@ -265,8 +265,9 @@ def produce_counterfactuals(pipe, prompt, factual_batch: torch.Tensor, scm: nn.M
     factual_batch = {k: v.to(device) for k, v in factual_batch.items()}
     batch_size = factual_batch["image"].shape[0]
 
-    interventions = _sample_interventions(do_parent, factual_batch, possible_values, bins,
-                                           intervention_source, force_change, device)
+    if interventions is None:
+        interventions = _sample_interventions(do_parent, factual_batch, possible_values, bins,
+                                             intervention_source, force_change, device)
 
     attr_keys = ddim_modules.get_dataset_attrs(args.dataset)
     label = torch.cat([factual_batch[k] for k in attr_keys], dim=1)
@@ -295,7 +296,7 @@ def produce_counterfactuals(pipe, prompt, factual_batch: torch.Tensor, scm: nn.M
     if args.editing == 'p2p':
         blend_params, cross_replace_steps, self_replace_steps = _p2p_blend_params(args.dataset, intervention_indx)
         normalized_tensor, _, causal_cond, _ = ddim_modules.P2P_editing(
-            pipe, factual_batch["image"], label.clone(), prompt, args.presudo_list,
+            pipe, factual_batch["image"], label.clone(), args.presudo_token_ids, prompt, args.presudo_list,
             num_steps=int(args.num_steps), invert_guidance_scale=1.0,
             set_guidance_scale=args.guidance_scale, intervention_indx=intervention_indx,
             intervention_values=intervention_values, return_PIL=False,
@@ -304,7 +305,7 @@ def produce_counterfactuals(pipe, prompt, factual_batch: torch.Tensor, scm: nn.M
             DSCM_labels=dscm_labels.unsqueeze(2), return_recons_counter=True)
     else:
         normalized_tensor, _, causal_cond, _ = ddim_modules.ddim_editing(
-            pipe, factual_batch["image"], label.clone(), prompt, num_steps=int(args.num_steps),
+            pipe, factual_batch["image"], label.clone(), args.presudo_token_ids, prompt, num_steps=int(args.num_steps),
             invert_guidance_scale=1.0, set_guidance_scale=args.guidance_scale,
             intervention_indx=intervention_indx, intervention_values=intervention_values,
             return_PIL=False, DSCM_labels=dscm_labels, pnp_inversion=args.NTI)
@@ -329,7 +330,7 @@ def produce_counterfactuals(pipe, prompt, factual_batch: torch.Tensor, scm: nn.M
         for attr in attr_keys:
             dim = attr_dims[attr]
             value = causal_cond[:, start:start + dim]
-            value = value.squeeze(1) if dim == 1 else value.squeeze(2)
+            value = value.reshape(batch_size, dim)
             counterfactual_batch[attr] = value
             start += dim
     else:
@@ -347,7 +348,7 @@ def produce_counterfactuals(pipe, prompt, factual_batch: torch.Tensor, scm: nn.M
 
     if args.editing == 'p2p':
         out_tensor_back, _, _, _ = ddim_modules.P2P_editing(
-            pipe, cf_tensor[batch_size:], dscm_labels.clone(), prompt, args.presudo_list,
+            pipe, cf_tensor[batch_size:], dscm_labels.clone(), args.presudo_token_ids, prompt, args.presudo_list,
             num_steps=int(args.num_steps), invert_guidance_scale=1.0,
             set_guidance_scale=args.guidance_scale, intervention_indx=intervention_indx,
             intervention_values=intervention_values, return_PIL=False,
@@ -357,7 +358,7 @@ def produce_counterfactuals(pipe, prompt, factual_batch: torch.Tensor, scm: nn.M
         recovered_from_cf = ddim_modules.resize_tensor(out_tensor_back, pipe, args.dataset, return_tensor=True)[batch_size:]
     else:
         out_tensor_back, _, _, _ = ddim_modules.ddim_editing(
-            pipe, cf_tensor, dscm_labels.clone(), prompt, num_steps=int(args.num_steps),
+            pipe, cf_tensor, dscm_labels.clone(), args.presudo_token_ids, prompt, num_steps=int(args.num_steps),
             invert_guidance_scale=1.0, set_guidance_scale=args.guidance_scale,
             intervention_indx=intervention_indx, intervention_values=intervention_values,
             return_PIL=False, DSCM_labels=label.clone(), pnp_inversion=args.NTI)
@@ -690,6 +691,13 @@ def parse_arguments():
     parser.add_argument("--resolution", type=int, default=256, help="Image resolution (default 256).")
     parser.add_argument("--dataloader_num_workers", type=int, default=8,
                         help="Number of subprocesses for data loading. 0 = load in the main process.")
+    parser.add_argument("--data-root", type=Path, help="ADNI preprocessing root")
+    parser.add_argument("--adnimerge-csv", type=Path)
+    parser.add_argument("--flow-checkpoint-dir", type=Path)
+    parser.add_argument("--predictor-checkpoint-dir", type=Path)
+    parser.add_argument("--unconditional-vae", type=Path, help="ADNI CLD checkpoint")
+    parser.add_argument("--interventions", nargs="+", default=None)
+    parser.add_argument("--smoke-samples", type=int, default=0)
     return parser.parse_args()
 
 
@@ -748,21 +756,27 @@ def build_predictors(dataset, attribute_size, intervention_attrs, config_cls, ar
     else:
         attribute_ids = get_attribute_ids(attribute_size)
         predictors = {atr: ADNIClassifier(attr=atr, num_outputs=config_cls["attribute_size"][atr],
-                                           children=config_cls["anticausal_graph"][atr],
+                                           children=list(config_cls["anticausal_graph"][atr]),
                                            num_slices=config_cls["attribute_size"]['slice'],
-                                           attribute_ids=attribute_ids, arch=config_cls['arch']) for atr in attribute_size.keys()}
+                                           attribute_ids=attribute_ids, arch=config_cls['arch']) for atr in intervention_attrs}
 
     for key, cls in predictors.items():
-        file_name = next((file for file in os.listdir(config_cls["ckpt_path"]) if file.startswith(key)), None)
-        print(key, file_name)
-        cls.load_state_dict(torch.load(config_cls["ckpt_path"] + file_name, map_location=torch.device('cuda'))["state_dict"])
+        if dataset == 'adni':
+            from adni_support import unique_checkpoint
+            checkpoint = unique_checkpoint(Path(config_cls["ckpt_path"]), key)
+        else:
+            file_name = next((file for file in os.listdir(config_cls["ckpt_path"]) if file.startswith(key)), None)
+            checkpoint = os.path.join(config_cls["ckpt_path"], file_name)
+        cls.load_state_dict(torch.load(checkpoint, map_location="cuda", weights_only=False)["state_dict"])
         cls.to('cuda')
         cls.eval()
     return predictors
 
 
-if __name__ == "__main__":
-    args = parse_arguments()
+def main(args=None):
+    global rng
+    args = args or parse_arguments()
+    rng = np.random.default_rng(args.seed)
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -770,31 +784,48 @@ if __name__ == "__main__":
 
     base_model_path = os.environ.get("CAUSAL_ADAPTER_SD15_BASE_MODEL", "lambdalabs/miniSD-diffusers")
     accelerator = Accelerator()
+    if accelerator.num_processes != 1 and args.dataset == "ADNI":
+        raise ValueError("ADNI runner requires one process to preserve exact sample counts")
+    if args.dataset == "ADNI":
+        from adni_support import validate_evaluator_args
+        validate_evaluator_args(args)
+
 
     # ---- build the diffusion pipeline ----
-    controlnet = Causal_ControlNetModel.from_pretrained(args.controlnet_path, torch_dtype=torch.float32)
-    prompt, presudo_words, A_matrix, cond_path = dataset_prompt_and_graph(args.dataset)
-    if cond_path is not None and os.path.exists(cond_path):
-        print('load pretrained controlnet cond-embedding weights')
-        controlnet.controlnet_cond_embedding.load_state_dict(torch.load(cond_path, weights_only=True))
-    print(prompt)
-    controlnet.controlnet_cond_embedding.update_mask(A_matrix)
-    controlnet.eval()
+    if args.dataset == 'ADNI':
+        from notebook_benchmarks.inference_utils import load_causal_adapter
+        assets = load_causal_adapter(
+            'ADNI', base_model_path, args.controlnet_path, args.mcpl_embedding_path,
+            scm_path=None, device=accelerator.device, torch_dtype=torch.float32)
+        pipe, prompt = assets.pipe, assets.prompt
+        args.presudo_token_ids = assets.presudo_token_ids
+        args.presudo_list = assets.presudo_list
+    else:
+        controlnet = Causal_ControlNetModel.from_pretrained(args.controlnet_path, torch_dtype=torch.float32)
+        prompt, presudo_words, A_matrix, cond_path = dataset_prompt_and_graph(args.dataset)
+        if cond_path is not None and os.path.exists(cond_path):
+            print('load pretrained controlnet cond-embedding weights')
+            controlnet.controlnet_cond_embedding.load_state_dict(torch.load(cond_path, weights_only=True))
+        print(prompt)
+        controlnet.controlnet_cond_embedding.update_mask(A_matrix)
+        controlnet.eval()
 
-    presudo_list = presudo_words.split(',')
-    args.presudo_list = presudo_list
-    tokenizer = CLIPTokenizer.from_pretrained(base_model_path, subfolder="tokenizer")
-    presudo_token_ids = tokenizer.encode(' '.join(presudo_list), add_special_tokens=False)
-    embed_control_manager_bool = 'image' not in controlnet.task_cond
-    text_encoder = ddim_modules.load_mcpl_embeddings(base_model_path, tokenizer, args.mcpl_embedding_path,
-                                                     presudo_token_ids, embed_control=embed_control_manager_bool)
+        presudo_list = presudo_words.split(',')
+        args.presudo_list = presudo_list
+        tokenizer = CLIPTokenizer.from_pretrained(base_model_path, subfolder="tokenizer")
+        presudo_token_ids = tokenizer.encode(' '.join(presudo_list), add_special_tokens=False)
+        args.presudo_token_ids = presudo_token_ids
+        embed_control_manager_bool = 'image' not in controlnet.task_cond
+        text_encoder = ddim_modules.load_mcpl_embeddings(base_model_path, tokenizer, args.mcpl_embedding_path,
+                                                         presudo_token_ids, embed_control=embed_control_manager_bool)
 
-    pipe = StableDiffusionCausalControlNetPipeline.from_pretrained(
-        base_model_path, controlnet=controlnet, text_encoder=text_encoder, torch_dtype=torch.float32)
-    pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
-    pipe.safety_checker = None
-    pipe.requires_safety_checker = False
-    pipe = pipe.to(accelerator.device)
+        pipe = StableDiffusionCausalControlNetPipeline.from_pretrained(
+            base_model_path, controlnet=controlnet, text_encoder=text_encoder, torch_dtype=torch.float32)
+        pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
+        pipe.safety_checker = None
+        pipe.requires_safety_checker = False
+        pipe = pipe.to(accelerator.device)
+
 
     # ---- load configs / SCM / datasets ----
     config_path, classifier_config = datasets_configs(args.dataset, anti_classifier=args.anti_classifier)
@@ -803,6 +834,10 @@ if __name__ == "__main__":
     with open(config_path, 'r') as f:
         config = load(f)
 
+    if args.flow_checkpoint_dir:
+        config["checkpoint_dir"] = str(args.flow_checkpoint_dir)
+    if args.predictor_checkpoint_dir:
+        config_cls["ckpt_path"] = str(args.predictor_checkpoint_dir)
     dataset = config["dataset"]
     attribute_size = config["attribute_size"]
     args.attribute_size = attribute_size
@@ -830,8 +865,13 @@ if __name__ == "__main__":
         train_set = data_class(attribute_size, split='train', transform=transform, resolution=args.resolution)
         test_set = data_class(attribute_size, split='test', transform=transform, resolution=args.resolution)
     else:
-        train_set = data_class(attribute_size, split='train', transform=transform)
-        test_set = data_class(attribute_size, split='test', transform=transform)
+        data_kwargs = {'dataset_dir': args.data_root, 'csv_path': args.adnimerge_csv} if dataset == 'adni' else {}
+        train_set = data_class(attribute_size, split='train', transform=transform, **data_kwargs)
+        test_set = data_class(attribute_size, split='test', transform=transform, **data_kwargs)
+
+    if dataset == "adni":
+        from adni_support import evaluate_adni
+        return evaluate_adni(sys.modules[__name__], args, pipe, prompt, scm, train_set, test_set, config_cls)
 
     if args.qualitative > 0:
         produce_qualitative_samples(pipe, prompt, dataset=test_set, scm=scm, parents=list(attribute_size.keys()),
@@ -862,3 +902,7 @@ if __name__ == "__main__":
         evaluate_minimality(pipe, prompt, accelerator, real_set=train_set, test_set=test_set, batch_size=batch_size,
                             scm=scm, attributes=list(attribute_size.keys()), embedding=args.embeddings,
                             embedding_fn=embedding_fn, args=args)
+
+
+if __name__ == "__main__":
+    main()

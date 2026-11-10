@@ -49,6 +49,8 @@ SPLIT_TRAIN_VAL_TEST = [
 
 
 def split_subjects(subjects, split):
+    if split not in dict(SPLIT_TRAIN_VAL_TEST):
+        raise ValueError(f"Unknown ADNI split: {split}")
     offset = 0
     for split_, percent in SPLIT_TRAIN_VAL_TEST:
         split_size = int(percent * len(subjects))
@@ -56,6 +58,19 @@ def split_subjects(subjects, split):
             return subjects[offset:offset + split_size]
         offset += split_size
     return subjects[offset:offset + split_size]
+
+
+def resolve_adnimerge(dataset_dir, csv_path=None):
+    """Require an explicit choice when more than one clinical export exists."""
+    if csv_path is not None:
+        path = Path(csv_path)
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        return path
+    paths = sorted(Path(dataset_dir).glob("ADNIMERGE*.csv"))
+    if len(paths) != 1:
+        raise ValueError(f"Expected one ADNIMERGE CSV in {dataset_dir}; found {len(paths)}. Pass csv_path explicitly.")
+    return paths[0]
 
 
 def _binary_encode_scalar(value: int, width: int) -> np.ndarray:
@@ -149,7 +164,11 @@ def load_extra_attributes(csv_path, attributes, attribute_dict, subject_dates_di
     indices_to_remove = []
 
     for idx, (subject, date) in enumerate(zip(attribute_dict["subject"], attribute_dict["date"])):
-        subject_df = df.loc[subject].sort_values(by="EXAMDATE")
+        if subject not in df.index:
+            indices_to_remove.append(idx)
+            continue
+        # A list lookup preserves the DataFrame shape for single-visit subjects.
+        subject_df = df.loc[[subject]].sort_values(by="EXAMDATE")
 
         # Same exception as in load_data: these subjects have volume measures
         # only at the second exam.
@@ -197,6 +216,7 @@ class ADNI(Dataset):
         num_of_slices=30,
         keep_only_screening=False,
         dataset_dir=_DEFAULT_DATASET_DIR,
+        csv_path=None,
     ):
         super().__init__()
         self.has_valid_set = True
@@ -216,9 +236,7 @@ class ADNI(Dataset):
             keep_only_screening=keep_only_screening,
         )
 
-        csv_paths = list(Path(dataset_dir).glob("ADNIMERGE*.csv"))
-        assert csv_paths and csv_paths[0].is_file(), "Provide ADNIMERGE csv path"
-        csv_path = csv_paths[0]
+        csv_path = resolve_adnimerge(dataset_dir, csv_path)
 
         self.attributes, indices_to_remove = load_extra_attributes(
             csv_path,

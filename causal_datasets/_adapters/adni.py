@@ -20,7 +20,7 @@ from PIL import Image
 from torchvision import transforms
 
 from .._normalization import normalize as adni_normalize
-from ..adni_dataset import load_data, load_extra_attributes
+from ..adni_dataset import load_data, load_extra_attributes, resolve_adnimerge
 from .base import DatasetAdapter, make_normalize_transform
 
 
@@ -50,9 +50,7 @@ class ADNIAdapter(DatasetAdapter):
             keep_only_screening=False,
         )
 
-        csv_paths = list(Path(data_root).glob("ADNIMERGE*.csv"))
-        assert csv_paths and csv_paths[0].is_file(), "Provide ADNIMERGE csv path"
-        csv_path = csv_paths[0]
+        csv_path = resolve_adnimerge(data_root)
 
         attributes, indices_to_remove = load_extra_attributes(
             csv_path,
@@ -98,7 +96,7 @@ class ADNIAdapter(DatasetAdapter):
         return Image.fromarray(image_array, mode="L")
 
     def extend_text(self, text: str) -> str:
-        # ADNI uses a one-hot slice encoder, so the placeholder must be repeated
+        # ADNI uses a thermometer slice encoder, so the placeholder is repeated
         # ``num_of_slices`` times in the prompt.
         if self.num_of_slices > 1:
             return text + (" " + text[-1]) * (self.num_of_slices - 1)

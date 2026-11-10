@@ -54,5 +54,7 @@ dependencies:
       - wandb==0.24.2
       - tensorboard
       - lpips
+      - normflows==1.7.3
+      - torch-fidelity==0.3.0
       - gdown
       - clip @ git+https://github.com/openai/CLIP.git

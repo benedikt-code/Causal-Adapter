@@ -1,0 +1,13 @@
+{
+  "data_root": "<approved ADNI preprocessing root>",
+  "adnimerge_csv": "<explicit ADNIMERGE CSV file>",
+  "base_model": "<local miniSD Diffusers snapshot>",
+  "controlnet": "<released weights>/ADNI/controlnet/controlnet-steps-100000.safetensors",
+  "embeddings": "<released weights>/ADNI/controlnet/learned_embeds-steps-100000.safetensors",
+  "flow_dir": "<directory containing exactly one checkpoint per benchmark volume flow>",
+  "predictor_dir": "<directory containing one brain_vol, vent_vol, slice checkpoint each>",
+  "unconditional_vae": "<benchmark ADNI unconditional VAE checkpoint file>",
+  "seed": 40,
+  "batch_size": 2,
+  "workers": 0
+}
